@@ -3,7 +3,7 @@ This card can be added through HACS.
 
 In HACS add a custom repository:
 ```
-  Set repository to: https://github.com/GalaxyGateway/lovelace-galaxy-groups
+  Set repository to: https://github.com/GalaxyGateway/lovelace-galaxy-eventlog
   Set category to: lovelace
 ```
 
