@@ -1,5 +1,4 @@
 // Galaxy Gateway — Event Log Card for Home Assistant
-// Uses HA History API to fetch past states — no REST sensor needed.
 // Place in /config/www/lovelace-galaxy-eventlog.js
 // Add to resources: /local/lovelace-galaxy-eventlog.js (type: module)
 
@@ -7,13 +6,11 @@ const DEFAULT_SIA_COLORS = [
   { code: 'BA', color: '#ef4444', label: 'Burglary Alarm' },
   { code: 'FA', color: '#f97316', label: 'Fire Alarm' },
   { code: 'PA', color: '#ef4444', label: 'Panic Alarm' },
-  { code: 'HA', color: '#ef4444', label: 'Hold-Up Alarm' },
   { code: 'TA', color: '#f59e0b', label: 'Tamper' },
   { code: 'CA', color: '#22c55e', label: 'Cancel' },
   { code: 'CL', color: '#22c55e', label: 'Closing' },
   { code: 'OP', color: '#3b82f6', label: 'Opening' },
   { code: 'RR', color: '#22c55e', label: 'System Restore' },
-  { code: 'OA', color: '#3b82f6', label: 'Disarmed' },
 ];
 
 const SIA_CODES = [
@@ -35,111 +32,187 @@ class GalaxyEventLogCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
-    this._config  = {};
-    this._hass    = null;
-    this._events  = [];
-    this._loading = true;
-    this._error   = null;
-    this._lastFetch = 0;
+    this._config        = {};
+    this._hass          = null;
+    this._events        = [];
+    this._fetching      = false;
+    this._error         = null;
+    this._unsubscribe   = null;   // websocket subscription teardown
+    this._subscribedFor = null;   // entity we are currently subscribed to
   }
 
   setConfig(config) {
-    // Never throw — HA drops to raw YAML editor if setConfig throws.
-    // Render a "no entity" placeholder instead.
+    if (!config.entity) throw new Error('entity is required');
     this._config = {
-      entity:       config.entity || '',
+      entity:       config.entity,
       title:        config.title        || 'Event Log',
-      hours:        config.hours        || 24,
-      max_events:   config.max_events   || 20,
+      max_events:   config.max_events   || 50,
+      history_days: config.history_days || 7,
       filter_codes: config.filter_codes || [],
-      sia_colors:   config.sia_colors   || [...DEFAULT_SIA_COLORS],
+      sia_colors:   config.sia_colors   || DEFAULT_SIA_COLORS,
     };
-    this._events  = [];
-    this._loading = true;
-    this._error   = null;
-    this._lastFetch = 0;
+    // If entity changed, tear down old subscription
+    if (this._subscribedFor && this._subscribedFor !== config.entity) {
+      this._teardown();
+    }
+    this._events = [];
     this._render();
   }
 
   set hass(hass) {
-    const prev = this._hass;
     this._hass = hass;
-    // Fetch history on first load or when entity state changes (new event arrived)
-    const prevState = prev?.states[this._config.entity]?.state;
-    const currState = hass?.states[this._config.entity]?.state;
-    const stale = Date.now() - this._lastFetch > 10000;
-    if (!prev || prevState !== currState || stale) {
-      this._fetchHistory();
+    // Subscribe once per entity — this drives both initial load and live updates
+    if (this._config.entity && this._subscribedFor !== this._config.entity) {
+      this._subscribe();
     }
   }
 
-  async _fetchHistory() {
-    if (!this._hass || !this._config.entity) {
-      this._loading = false;
-      this._render();
-      return;
+  disconnectedCallback() {
+    this._teardown();
+  }
+
+  _teardown() {
+    if (this._unsubscribe) {
+      this._unsubscribe();
+      this._unsubscribe   = null;
+      this._subscribedFor = null;
     }
-    this._lastFetch = Date.now();
-    const end   = new Date();
-    const start = new Date(end.getTime() - this._config.hours * 3600 * 1000);
-    // Use same approach as Royto logbook card — fetch history with attributes.
-    // callApi path must NOT include leading /api/.
-    // significant_changes_only=false ensures every state change is returned.
-    const path = `history/period/${start.toISOString()}` +
-      `?filter_entity_id=${this._config.entity}` +
-      `&end_time=${end.toISOString()}` +
-      `&significant_changes_only=false`;
+  }
+
+  // ── Subscribe to state_changed for this entity via WS ────────────────────
+  // When a new event fires we prepend it immediately without re-fetching
+  // the full history — so updates are instant.
+  async _subscribe() {
+    if (!this._hass || !this._config.entity) return;
+
+    const entity = this._config.entity;
+    this._subscribedFor = entity;
+
+    // Initial history load
+    this._fetchHistory();
+
     try {
-      const res = await this._hass.callApi('GET', path);
-      this._events  = this._parseHistory(res);
-      this._loading = false;
-      this._error   = null;
+      // subscribe_trigger gives us new_state the moment it changes
+      this._unsubscribe = await this._hass.connection.subscribeMessage(
+        (msg) => {
+          const newState = msg?.variables?.trigger?.to_state;
+          if (!newState) return;
+          const attr = newState.attributes || {};
+          const code = (attr.code || '').toUpperCase();
+          if (!code) return;
+
+          const evtDate = attr.evt_date || attr.date || '';
+          const evtTime = attr.evt_time || attr.time
+            || (newState.last_changed || '').substring(11, 19);
+
+          const event = {
+            date:    evtDate,
+            time:    evtTime,
+            code,
+            account: attr.account || '',
+            userid:  attr.userid  || '',
+            text:    attr.text    || '',
+            area:    attr.area    || '',
+            address: attr.address || '',
+          };
+
+          // Prepend — deduplicate on date+time+code in case history already has it
+          const key = `${evtDate}|${evtTime}|${code}`;
+          const alreadyPresent = this._events.some(
+            e => `${e.date}|${e.time}|${e.code}` === key
+          );
+          if (!alreadyPresent) {
+            this._events = [event, ...this._events];
+            this._render();
+          }
+        },
+        {
+          type:    'subscribe_trigger',
+          trigger: { platform: 'state', entity_id: entity },
+        }
+      );
     } catch(e) {
-      this._error   = `History API error: ${e.message || e}`;
-      this._loading = false;
+      console.error('GalaxyEventLog: subscribe failed', e);
+      // Non-fatal — history was already fetched, live updates just won't work
     }
-    this._render();
   }
 
-  _parseHistory(res) {
-    // res is an array of entity arrays: [[state1, state2, ...]]
-    // Each state has: { state, attributes, last_changed, last_updated }
-    // Attributes contain the event fields pushed by the firmware.
-    if (!Array.isArray(res) || res.length === 0) return [];
-    const states = res[0];
-    if (!Array.isArray(states)) return [];
+  // ── Full history load (runs once on subscribe) ────────────────────────────
+  async _fetchHistory() {
+    if (this._fetching || !this._hass || !this._config.entity) return;
+    this._fetching = true;
+    this._error    = null;
+    this._render();
 
-    let events = [];
-    for (const s of states) {
-      const attr = s.attributes || {};
+    try {
+      const days  = this._config.history_days || 7;
+      const end   = new Date();
+      const start = new Date(end - days * 86400 * 1000);
 
-      // Code lives in attributes.code (from autodiscovery MQTT sensor)
-      const code = (attr.code || attr.Code || '').toUpperCase().trim();
+      let states = null;
 
-      // Skip states without a valid 2-letter SIA code
-      if (!code || code.length < 2 || code.length > 4) continue;
-      if (['UNAVAILABLE','UNKNOWN','NONE',''].includes(code)) continue;
+      // Primary: history WS (HA 2023.3+)
+      try {
+        const msg = await this._hass.callWS({
+          type:                     'history/history_during_period',
+          start_time:               start.toISOString(),
+          end_time:                 end.toISOString(),
+          entity_ids:               [this._config.entity],
+          include_start_time_state: true,
+          significant_changes_only: false,
+          no_attributes:            false,
+        });
+        const key = Object.keys(msg || {})[0];
+        states = key ? msg[key] : null;
+      } catch(wsErr) {
+        console.warn('GalaxyEventLog: history WS failed, falling back to REST', wsErr);
+      }
 
-      events.push({
-        ts:   s.last_changed || s.last_updated || '',
-        acc:  attr.acc      || attr.account   || '',
-        date: attr.date     || '',
-        time: attr.time     || '',
-        code: code,
-        user: attr.user     || attr.userid    || '',
-        area: attr.area     || '',
-        addr: attr.addr     || attr.address   || attr.device || attr.on || attr.nr || '',
-        text: attr.text     || attr.Text      || '',
-      });
+      // Fallback: REST API
+      if (!states) {
+        const path = `history/period/${start.toISOString()}?filter_entity_id=${this._config.entity}&minimal_response=false&no_attributes=false&significant_changes_only=false`;
+        const raw  = await this._hass.callApi('GET', path);
+        const arr  = raw?.[0] || [];
+        states = arr.map(s => ({ s: s.state, a: s.attributes || {}, lu: s.last_changed }));
+      }
+
+      this._events = this._parseStates(states || []);
+
+    } catch(e) {
+      console.error('GalaxyEventLog: history fetch failed', e);
+      this._error = e.message || 'Failed to load history';
+    } finally {
+      this._fetching = false;
+      this._render();
     }
+  }
 
-    // Most recent first
-    events.reverse();
+  // ── Parse raw state snapshots into event rows ─────────────────────────────
+  _parseStates(states) {
+    const seen   = new Set();
+    const events = [];
+    for (let i = states.length - 1; i >= 0; i--) {
+      const entry = states[i];
+      const attr  = entry.a || entry.attributes || {};
+      const code  = (attr.code || '').toUpperCase();
+      if (!code) continue;
+      const evtDate = attr.evt_date || attr.date || '';
+      const evtTime = attr.evt_time || attr.time
+        || (entry.lu || entry.last_changed || '').substring(11, 19);
+      const key = `${evtDate}|${evtTime}|${code}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      events.push({ date: evtDate, time: evtTime, code,
+        account: attr.account || '', userid: attr.userid || '',
+        text: attr.text || '', area: attr.area || '', address: attr.address || '' });
+    }
+    return events;
+  }
 
-    // Filter by SIA code
+  _getEvents() {
+    let events = this._events || [];
     const fc = this._config.filter_codes;
     if (fc && fc.length > 0) events = events.filter(e => fc.includes(e.code));
-
     return events.slice(0, this._config.max_events);
   }
 
@@ -147,145 +220,119 @@ class GalaxyEventLogCard extends HTMLElement {
     const match = (this._config.sia_colors || []).find(c => c.code === code);
     return match ? match.color : null;
   }
-
-  _isAlarm(code) {
-    return ['BA','FA','PA','HA','JA','TA','DF','DK'].includes(code);
-  }
-
-  _isGood(code) {
-    return ['CA','CL','CG','RR','RF','OA'].includes(code);
-  }
-
-  _fmtTime(iso) {
-    if (!iso) return '';
-    try {
-      return new Date(iso).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    } catch(e) { return iso; }
-  }
+  _isAlarm(code) { return ['BA','FA','PA','HA','JA','TA','DF','DK'].includes(code); }
+  _isGood(code)  { return ['CA','CL','CG','RR','RF'].includes(code); }
 
   _render() {
-    const events = this._events;
-    const cfg    = this._config;
+    const events   = this._getEvents();
+    const cfg      = this._config;
+    const entity   = this._hass?.states[cfg.entity];
+    const notFound = this._hass && cfg.entity && !entity;
 
     this.shadowRoot.innerHTML = `
 <style>
   :host { display: block; }
   .card {
     background: var(--card-background-color, #fff);
-    border-radius: 12px;
-    overflow: hidden;
+    border-radius: 12px; overflow: hidden;
     box-shadow: var(--ha-card-box-shadow, 0 2px 8px rgba(0,0,0,.08));
     border: 1px solid var(--divider-color, #e0e0e0);
   }
   .card-header {
     display: flex; align-items: center; gap: 10px;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--divider-color, #e0e0e0);
+    padding: 12px 16px; border-bottom: 1px solid var(--divider-color, #e0e0e0);
   }
   .header-icon {
-    width: 28px; height: 28px;
-    background: rgba(59,130,246,.12);
-    border-radius: 7px;
+    width: 28px; height: 28px; background: rgba(59,130,246,.12); border-radius: 7px;
     display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   }
   .header-icon svg { width: 15px; height: 15px; }
   .header-title { flex: 1; font-size: 14px; font-weight: 600; color: var(--primary-text-color); }
-  .header-meta  { font-size: 11px; color: var(--secondary-text-color);
-                  background: var(--secondary-background-color, #f5f5f5);
-                  padding: 2px 8px; border-radius: 20px; white-space: nowrap; }
+  .header-count {
+    font-size: 11px; color: var(--secondary-text-color);
+    background: var(--secondary-background-color, #f5f5f5); padding: 2px 8px; border-radius: 20px;
+  }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   thead th {
-    padding: 7px 12px; text-align: left;
-    font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
-    color: var(--secondary-text-color);
+    padding: 7px 12px; text-align: left; font-size: 10px; font-weight: 600;
+    letter-spacing: .05em; text-transform: uppercase; color: var(--secondary-text-color);
     border-bottom: 1px solid var(--divider-color, #e0e0e0);
-    background: var(--secondary-background-color, #f5f5f5);
-    white-space: nowrap;
+    background: var(--secondary-background-color, #f5f5f5); white-space: nowrap;
   }
-  tbody tr { border-bottom: 1px solid var(--divider-color, #e0e0e0); }
+  tbody tr { border-bottom: 1px solid var(--divider-color, #e0e0e0); transition: background .08s; }
   tbody tr:last-child { border-bottom: none; }
   tbody tr:hover { background: var(--secondary-background-color, #f5f5f5); }
   tbody td { padding: 8px 12px; color: var(--secondary-text-color); vertical-align: middle; }
   td.code-cell { font-family: var(--code-font-family, monospace); font-weight: 600; font-size: 11px; white-space: nowrap; }
-  td.txt-cell  { color: var(--primary-text-color); }
+  td.txt-cell  { color: var(--primary-text-color); max-width: 200px; }
   td.acc-cell  { color: var(--primary-text-color); font-family: monospace; }
-  td.time-cell { white-space: nowrap; }
-  .dot {
+  .color-dot {
     display: inline-block; width: 7px; height: 7px;
     border-radius: 50%; margin-right: 5px; vertical-align: middle; flex-shrink: 0;
   }
-  .row-alarm { background: rgba(239,68,68,.06) !important; border-left: 3px solid #ef4444; }
+  .row-alarm { background: rgba(239,68,68,.06); border-left: 3px solid #ef4444 !important; }
   .row-alarm td { color: var(--primary-text-color); }
-  .row-good  { background: rgba(34,197,94,.06)  !important; border-left: 3px solid #22c55e; }
+  .row-good  { background: rgba(34,197,94,.06);  border-left: 3px solid #22c55e !important; }
   .row-good td { color: var(--primary-text-color); }
-  .status { padding: 24px 16px; text-align: center; color: var(--secondary-text-color); font-size: 13px; }
+  .status { padding: 20px 16px; text-align: center; color: var(--secondary-text-color); font-size: 13px; }
   .status.error { color: var(--error-color, #ef4444); }
-  .spinner {
-    display: inline-block; width: 18px; height: 18px;
-    border: 2px solid var(--divider-color); border-top-color: #3b82f6;
-    border-radius: 50%; animation: spin .8s linear infinite; margin-right: 8px;
-    vertical-align: middle;
+  .warn {
+    padding: 10px 16px; font-size: 12px; color: var(--warning-color, #f59e0b);
+    background: rgba(245,158,11,.08); border-bottom: 1px solid var(--divider-color);
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner {
+    display: inline-block; width: 16px; height: 16px;
+    border: 2px solid var(--divider-color); border-top-color: #3b82f6;
+    border-radius: 50%; animation: spin .8s linear infinite; vertical-align: middle; margin-right: 8px;
+  }
 </style>
 <div class="card">
   <div class="card-header">
     <div class="header-icon">
       <svg viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M6 2Q5 2 5 3L5 21Q5 22 6 22L18 22Q19 22 19 21L19 7L14 2Z" stroke-linejoin="round"/>
-        <polyline points="14 2 14 7 19 7" stroke-linejoin="round"/>
+        <path d="M6 2Q5 2 5 3L5 21Q5 22 6 22L18 22Q19 22 19 21L19 7L14 2Z"/>
+        <polyline points="14 2 14 7 19 7"/>
         <line x1="8" y1="11" x2="16" y2="11"/><line x1="8" y1="15" x2="16" y2="15"/>
       </svg>
     </div>
-    <span class="header-title">${cfg.title}</span>
-    <span class="header-meta">
-      ${this._loading ? '' : `${events.length} events · last ${cfg.hours}h`}
-    </span>
+    <span class="header-title">${cfg.title || 'Event Log'}</span>
+    <span class="header-count">${this._fetching ? '…' : events.length + ' entr' + (events.length === 1 ? 'y' : 'ies')}</span>
   </div>
-
-  ${!cfg.entity    ? `<div class="status">Select an entity in the card editor</div>` :
-    this._loading ? `<div class="status"><span class="spinner"></span>Loading history…</div>` :
-    this._error   ? `<div class="status error">${this._error}</div>` :
-    events.length === 0 ? `<div class="status">No events in the last ${cfg.hours} hours</div>` :
-    `<div class="table-wrap"><table>
+  ${notFound ? `<div class="warn">Entity <strong>${cfg.entity}</strong> not found</div>` : ''}
+  ${this._error    ? `<div class="status error">&#9888; ${this._error}</div>`
+  : this._fetching ? `<div class="status"><span class="spinner"></span>Loading history&#8230;</div>`
+  : events.length === 0 ? `<div class="status">No events</div>`
+  : `<div class="table-wrap"><table>
       <thead><tr>
-        <th>Time</th><th>Account</th><th>Code</th>
-        <th>User</th><th>Area</th><th>Addr</th><th>Event</th>
+        <th>Date</th><th>Time</th><th>Code</th>
+        <th>Account</th><th>User</th><th>Area</th><th>Addr</th><th>Event</th>
       </tr></thead>
-      <tbody>
-        ${events.map(ev => {
-          const color    = this._colorForCode(ev.code);
-          const alarm    = this._isAlarm(ev.code);
-          const good     = this._isGood(ev.code);
-          const rowClass = alarm ? 'row-alarm' : good ? 'row-good' : '';
-          const dotStyle = color
-            ? `background:${color}`
-            : alarm ? 'background:#ef4444'
-            : good  ? 'background:#22c55e'
-            : 'display:none';
-          const timeStr  = ev.time || this._fmtTime(ev.ts);
-          return `<tr class="${rowClass}">
-            <td class="time-cell">${timeStr}</td>
-            <td class="acc-cell">${ev.acc}</td>
-            <td class="code-cell"><span class="dot" style="${dotStyle}"></span>${ev.code}</td>
-            <td>${ev.user}</td>
-            <td>${ev.area}</td>
-            <td>${ev.addr}</td>
-            <td class="txt-cell">${ev.text}</td>
-          </tr>`;
-        }).join('')}
-      </tbody>
+      <tbody>${events.map(ev => {
+        const color    = this._colorForCode(ev.code);
+        const alarm    = this._isAlarm(ev.code);
+        const good     = this._isGood(ev.code);
+        const rowClass = alarm ? 'row-alarm' : good ? 'row-good' : '';
+        const dotStyle = color ? `background:${color}` : alarm ? 'background:#ef4444' : good ? 'background:#22c55e' : 'display:none';
+        return `<tr class="${rowClass}">
+          <td>${ev.date}</td><td>${ev.time}</td>
+          <td class="code-cell"><span class="color-dot" style="${dotStyle}"></span>${ev.code}</td>
+          <td class="acc-cell">${ev.account}</td>
+          <td>${ev.userid}</td><td>${ev.area}</td><td>${ev.address}</td>
+          <td class="txt-cell">${ev.text}</td>
+        </tr>`;
+      }).join('')}</tbody>
     </table></div>`}
 </div>`;
   }
 
   static getConfigElement() { return document.createElement('lovelace-galaxy-eventlog-editor'); }
-  static getStubConfig()    { return { entity: '', title: 'Event Log', hours: 24, max_events: 20, filter_codes: [], sia_colors: [...DEFAULT_SIA_COLORS] }; }
+  static getStubConfig()    { return { entity: '', title: 'Event Log', max_events: 50, history_days: 7, filter_codes: [], sia_colors: DEFAULT_SIA_COLORS }; }
   getCardSize()             { return 4; }
 }
 
-// ── Editor ────────────────────────────────────────────────────────────────────
+// ── Editor element ────────────────────────────────────────────────────────────
 class GalaxyEventLogCardEditor extends HTMLElement {
   constructor() {
     super();
@@ -296,48 +343,51 @@ class GalaxyEventLogCardEditor extends HTMLElement {
 
   setConfig(config) {
     this._config = {
-      entity:       config.entity       || '',
-      title:        config.title        || 'Event Log',
-      hours:        config.hours        || 24,
-      max_events:   config.max_events   || 20,
-      filter_codes: config.filter_codes || [],
-      sia_colors:   config.sia_colors   || [...DEFAULT_SIA_COLORS],
+      entity:       config.entity        || '',
+      title:        config.title         || 'Event Log',
+      max_events:   config.max_events    || 50,
+      history_days: config.history_days  || 7,
+      filter_codes: config.filter_codes  || [],
+      sia_colors:   config.sia_colors    || [...DEFAULT_SIA_COLORS],
     };
     this._render();
   }
 
   set hass(hass) { this._hass = hass; }
 
-  _fire() {
-    this.dispatchEvent(new CustomEvent('config-changed', {
-      detail: { config: { ...this._config } }, bubbles: true, composed: true
-    }));
+  _fire(config) {
+    this.dispatchEvent(new CustomEvent('config-changed', { detail: { config }, bubbles: true, composed: true }));
   }
 
   _addColorRule() {
-    this._config.sia_colors = [...(this._config.sia_colors||[]), { code:'BA', color:'#ef4444', label:'' }];
-    this._fire(); this._render();
+    const sc = [...(this._config.sia_colors || [])];
+    sc.push({ code: 'BA', color: '#ef4444', label: '' });
+    this._config.sia_colors = sc;
+    this._fire({ ...this._config });
+    this._render();
   }
 
   _removeColorRule(idx) {
-    const sc = [...(this._config.sia_colors||[])];
+    const sc = [...(this._config.sia_colors || [])];
     sc.splice(idx, 1);
     this._config.sia_colors = sc;
-    this._fire(); this._render();
+    this._fire({ ...this._config });
+    this._render();
   }
 
   _updateColorRule(idx, field, value) {
-    const sc = [...(this._config.sia_colors||[])];
+    const sc = [...(this._config.sia_colors || [])];
     sc[idx] = { ...sc[idx], [field]: value };
     this._config.sia_colors = sc;
-    this._fire();
+    this._fire({ ...this._config });
   }
 
   _toggleFilter(code) {
-    let fc = [...(this._config.filter_codes||[])];
+    let fc = [...(this._config.filter_codes || [])];
     fc = fc.includes(code) ? fc.filter(c => c !== code) : [...fc, code];
     this._config.filter_codes = fc;
-    this._fire(); this._render();
+    this._fire({ ...this._config });
+    this._render();
   }
 
   _render() {
@@ -345,33 +395,26 @@ class GalaxyEventLogCardEditor extends HTMLElement {
     const fc  = cfg.filter_codes || [];
     const sc  = cfg.sia_colors   || [];
 
-    let entityOpts = '<option value="">— select entity —</option>';
+    let entityOpts = '<option value="">-- select entity --</option>';
     if (this._hass) {
       Object.keys(this._hass.states)
-        .filter(k => k.includes('event_'))
+        .filter(k => k.startsWith('sensor.') || k.startsWith('input_text.'))
         .sort()
         .forEach(k => {
-          entityOpts += `<option value="${k}"${k===cfg.entity?' selected':''}>${k}</option>`;
+          entityOpts += `<option value="${k}" ${k === cfg.entity ? 'selected' : ''}>${k}</option>`;
         });
-      // Keep currently selected entity in the list even if it doesn't match the filter
-      if (cfg.entity && !cfg.entity.includes('event_')) {
-        entityOpts += `<option value="${cfg.entity}" selected>${cfg.entity}</option>`;
-      }
     }
 
     this.shadowRoot.innerHTML = `
 <style>
   :host { display: block; font-size: 14px; }
   .row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
-  .row-h { display: flex; gap: 12px; margin-bottom: 14px; }
-  .row-h .row { flex: 1; margin-bottom: 0; }
   label { font-size: 11px; font-weight: 600; color: var(--secondary-text-color); text-transform: uppercase; letter-spacing: .05em; }
   input[type=text], input[type=number], select {
     width: 100%; height: 36px; padding: 0 10px;
     background: var(--secondary-background-color, #f5f5f5);
     border: 1px solid var(--divider-color, #e0e0e0); border-radius: 8px;
-    color: var(--primary-text-color); font-family: inherit; font-size: 13px;
-    box-sizing: border-box;
+    color: var(--primary-text-color); font-family: inherit; font-size: 13px; box-sizing: border-box;
   }
   input[type=color] {
     width: 40px; height: 32px; padding: 2px 4px;
@@ -381,95 +424,84 @@ class GalaxyEventLogCardEditor extends HTMLElement {
   .sect {
     font-size: 11px; font-weight: 600; color: var(--secondary-text-color);
     text-transform: uppercase; letter-spacing: .05em;
-    margin: 18px 0 8px; padding-bottom: 5px;
-    border-bottom: 1px solid var(--divider-color, #e0e0e0);
+    margin: 18px 0 8px; padding-bottom: 5px; border-bottom: 1px solid var(--divider-color, #e0e0e0);
   }
-  .note { font-size: 11px; color: var(--secondary-text-color); margin-bottom: 8px; }
-  .filter-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(50px, 1fr)); gap: 4px;
-  }
+  .filter-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(52px, 1fr)); gap: 4px; }
   .filter-btn {
-    padding: 4px 4px; border-radius: 6px;
-    border: 1px solid var(--divider-color);
-    background: var(--secondary-background-color);
-    color: var(--secondary-text-color);
-    font-size: 11px; font-weight: 600; font-family: monospace;
-    cursor: pointer; text-align: center;
+    padding: 4px 6px; border-radius: 6px; border: 1px solid var(--divider-color);
+    background: var(--secondary-background-color); color: var(--secondary-text-color);
+    font-size: 11px; font-weight: 600; font-family: monospace; cursor: pointer; text-align: center;
   }
-  .filter-btn.on { background: rgba(59,130,246,.15); border-color: #3b82f6; color: #3b82f6; }
+  .filter-btn.active { background: rgba(59,130,246,.15); border-color: #3b82f6; color: #3b82f6; }
   .color-rules { display: flex; flex-direction: column; gap: 8px; }
-  .cr { display: flex; align-items: center; gap: 6px; }
-  .cr select { flex: 1; }
-  .cr input[type=text] { flex: 1.5; }
-  .del { width: 28px; height: 28px; border: none; border-radius: 6px;
-         background: rgba(239,68,68,.1); color: #ef4444; cursor: pointer;
-         font-size: 18px; line-height: 1; flex-shrink: 0; }
-  .add { margin-top: 6px; height: 32px; width: 100%;
-         border: 1px dashed var(--divider-color); border-radius: 8px;
-         background: transparent; color: var(--secondary-text-color); font-size: 12px; cursor: pointer; }
-  .add:hover { background: var(--secondary-background-color); }
+  .color-rule { display: flex; align-items: center; gap: 6px; }
+  .color-rule select { flex: 1; }
+  .color-rule input[type=text] { flex: 1.5; }
+  .del-btn {
+    width: 28px; height: 28px; border: none; border-radius: 6px;
+    background: rgba(239,68,68,.1); color: #ef4444;
+    cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .add-btn {
+    margin-top: 6px; height: 32px; width: 100%;
+    border: 1px dashed var(--divider-color); border-radius: 8px; background: transparent;
+    color: var(--secondary-text-color); font-size: 12px; cursor: pointer;
+  }
+  .filter-note { font-size: 11px; color: var(--secondary-text-color); margin-bottom: 6px; }
 </style>
 
-<div class="row">
-  <label>Entity</label>
-  <select id="ent">${entityOpts}</select>
-</div>
-<div class="row">
-  <label>Title</label>
-  <input type="text" id="ttl" value="${cfg.title}">
-</div>
-<div class="row-h">
-  <div class="row">
-    <label>History (hours)</label>
-    <input type="number" id="hrs" min="1" max="168" value="${cfg.hours}">
-  </div>
-  <div class="row">
-    <label>Max events</label>
-    <input type="number" id="max" min="1" max="100" value="${cfg.max_events}">
-  </div>
-</div>
+<div class="row"><label>Entity</label><select id="entity">${entityOpts}</select></div>
+<div class="row"><label>Title</label><input type="text" id="title" value="${cfg.title}"></div>
+<div class="row"><label>Max Events</label><input type="number" id="max_events" min="1" max="200" value="${cfg.max_events}"></div>
+<div class="row"><label>History (days)</label><input type="number" id="history_days" min="1" max="30" value="${cfg.history_days}"></div>
 
 <div class="sect">Filter by SIA code</div>
-<div class="note">Active = show only these codes. None active = show all.</div>
+<div class="filter-note">Select codes to show — leave all unselected to show all</div>
 <div class="filter-grid">
-  ${SIA_CODES.map(c => `<button class="filter-btn${fc.includes(c)?' on':''}" data-code="${c}">${c}</button>`).join('')}
+  ${SIA_CODES.map(code => `<button class="filter-btn${fc.includes(code) ? ' active' : ''}" data-code="${code}">${code}</button>`).join('')}
 </div>
 
 <div class="sect">Code colour rules</div>
-<div class="color-rules" id="cr">
-  ${sc.map((r,i) => `
-  <div class="cr">
-    <select class="rc" data-i="${i}">
-      ${SIA_CODES.map(c=>`<option${c===r.code?' selected':''}>${c}</option>`).join('')}
-    </select>
-    <input type="text" class="rl" data-i="${i}" placeholder="Label" value="${r.label||''}">
-    <input type="color" class="rk" data-i="${i}" value="${r.color||'#3b82f6'}">
-    <button class="del" data-i="${i}">×</button>
-  </div>`).join('')}
+<div class="color-rules">
+  ${sc.map((rule, idx) => `
+    <div class="color-rule">
+      <select class="cr-code" data-idx="${idx}">
+        ${SIA_CODES.map(c => `<option value="${c}" ${c === rule.code ? 'selected' : ''}>${c}</option>`).join('')}
+      </select>
+      <input type="text" class="cr-label" data-idx="${idx}" placeholder="Label" value="${rule.label || ''}">
+      <input type="color" class="cr-color" data-idx="${idx}" value="${rule.color || '#3b82f6'}">
+      <button class="del-btn" data-delidx="${idx}">&#215;</button>
+    </div>`).join('')}
 </div>
-<button class="add" id="add">+ Add colour rule</button>
-`;
+<button class="add-btn" id="add-rule">+ Add colour rule</button>`;
 
-    this.shadowRoot.getElementById('ent').addEventListener('change', e => { this._config.entity = e.target.value; this._fire(); });
-    this.shadowRoot.getElementById('ttl').addEventListener('change', e => { this._config.title  = e.target.value; this._fire(); });
-    this.shadowRoot.getElementById('hrs').addEventListener('change', e => { this._config.hours  = +e.target.value || 24; this._fire(); });
-    this.shadowRoot.getElementById('max').addEventListener('change', e => { this._config.max_events = +e.target.value || 20; this._fire(); });
-    this.shadowRoot.querySelectorAll('.filter-btn').forEach(b => b.addEventListener('click', () => this._toggleFilter(b.dataset.code)));
-    this.shadowRoot.querySelectorAll('.rc').forEach(el => el.addEventListener('change', e => this._updateColorRule(+e.target.dataset.i, 'code',  e.target.value)));
-    this.shadowRoot.querySelectorAll('.rl').forEach(el => el.addEventListener('change', e => this._updateColorRule(+e.target.dataset.i, 'label', e.target.value)));
-    this.shadowRoot.querySelectorAll('.rk').forEach(el => el.addEventListener('input',  e => this._updateColorRule(+e.target.dataset.i, 'color', e.target.value)));
-    this.shadowRoot.querySelectorAll('.del').forEach(b => b.addEventListener('click', () => this._removeColorRule(+b.dataset.i)));
-    this.shadowRoot.getElementById('add').addEventListener('click', () => this._addColorRule());
+    this.shadowRoot.getElementById('entity').addEventListener('change', e => { this._config.entity = e.target.value; this._fire({ ...this._config }); });
+    this.shadowRoot.getElementById('title').addEventListener('change', e => { this._config.title = e.target.value; this._fire({ ...this._config }); });
+    this.shadowRoot.getElementById('max_events').addEventListener('change', e => { this._config.max_events = parseInt(e.target.value) || 50; this._fire({ ...this._config }); });
+    this.shadowRoot.getElementById('history_days').addEventListener('change', e => { this._config.history_days = parseInt(e.target.value) || 7; this._fire({ ...this._config }); });
+    this.shadowRoot.querySelectorAll('.filter-btn').forEach(btn => btn.addEventListener('click', () => this._toggleFilter(btn.dataset.code)));
+    this.shadowRoot.querySelectorAll('.cr-code').forEach(el => el.addEventListener('change', e => this._updateColorRule(+e.target.dataset.idx, 'code', e.target.value)));
+    this.shadowRoot.querySelectorAll('.cr-label').forEach(el => el.addEventListener('change', e => this._updateColorRule(+e.target.dataset.idx, 'label', e.target.value)));
+    this.shadowRoot.querySelectorAll('.cr-color').forEach(el => el.addEventListener('input', e => this._updateColorRule(+e.target.dataset.idx, 'color', e.target.value)));
+    this.shadowRoot.querySelectorAll('.del-btn').forEach(btn => btn.addEventListener('click', () => this._removeColorRule(+btn.dataset.delidx)));
+    this.shadowRoot.getElementById('add-rule').addEventListener('click', () => this._addColorRule());
   }
 }
 
 customElements.define('lovelace-galaxy-eventlog', GalaxyEventLogCard);
 customElements.define('lovelace-galaxy-eventlog-editor', GalaxyEventLogCardEditor);
 
+console.info(
+  "%c  lovelace-galaxy-eventlog  \n%c Version 0.3.0 ",
+  "color: orange; font-weight: bold; background: black",
+  "color: white; font-weight: bold; background: dimgray"
+);
+
 window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'lovelace-galaxy-eventlog',
   name: 'Galaxy Event Log',
-  description: 'Alarm event history from Galaxy Gateway via HA History API',
-  preview: false,
+  description: 'Displays alarm events from a Galaxy Gateway sensor in a filterable grid',
+  preview: true,
+  documentationURL: "https://github.com/GalaxyGateway/lovelace-galaxy-eventlog",
 });
