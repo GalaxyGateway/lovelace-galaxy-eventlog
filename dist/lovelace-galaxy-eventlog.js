@@ -116,10 +116,14 @@ class GalaxyEventLogCard extends HTMLElement {
             address: attr.address || '',
           };
 
-          // Prepend — deduplicate on date+time+code in case history already has it
-          const key = `${evtDate}|${evtTime}|${code}`;
+          // Prepend — deduplicate on date+time+code+account+address in case
+          // history already has it. account+address must be in the key:
+          // the same physical trigger reported over two separate paths
+          // (e.g. two ARC accounts) lands with an identical date+time+code
+          // but is a genuinely distinct event, not a duplicate.
+          const key = `${evtDate}|${evtTime}|${code}|${attr.account || ''}|${attr.address || ''}`;
           const alreadyPresent = this._events.some(
-            e => `${e.date}|${e.time}|${e.code}` === key
+            e => `${e.date}|${e.time}|${e.code}|${e.account}|${e.address}` === key
           );
           if (!alreadyPresent) {
             this._events = [event, ...this._events];
@@ -199,7 +203,7 @@ class GalaxyEventLogCard extends HTMLElement {
       const evtDate = attr.evt_date || attr.date || '';
       const evtTime = attr.evt_time || attr.time
         || (entry.lu || entry.last_changed || '').substring(11, 19);
-      const key = `${evtDate}|${evtTime}|${code}`;
+      const key = `${evtDate}|${evtTime}|${code}|${attr.account || ''}|${attr.address || ''}`;
       if (seen.has(key)) continue;
       seen.add(key);
       events.push({ date: evtDate, time: evtTime, code,
@@ -492,7 +496,7 @@ customElements.define('lovelace-galaxy-eventlog', GalaxyEventLogCard);
 customElements.define('lovelace-galaxy-eventlog-editor', GalaxyEventLogCardEditor);
 
 console.info(
-  "%c  lovelace-galaxy-eventlog  \n%c Version 0.3.0 ",
+  "%c  lovelace-galaxy-eventlog  \n%c Version 0.3.1 ",
   "color: orange; font-weight: bold; background: black",
   "color: white; font-weight: bold; background: dimgray"
 );
