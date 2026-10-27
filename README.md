@@ -1,4 +1,4 @@
-# HACS Lovelace group card
+# HACS Lovelace eventlog card
 This card can be added through HACS.
 
 In HACS add a custom repository:
